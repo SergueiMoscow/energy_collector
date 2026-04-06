@@ -14,16 +14,13 @@ from zoneinfo import ZoneInfo  # Python 3.9+
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
 
-# Загружаем переменные из .env файла (если он есть)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # если python-dotenv не установлен, продолжаем без .env
+# Загружаем переменные из .env файла
+load_dotenv()
 
 # ---------------------------------------------------------------------------
-# НАСТРОЙКИ — можно вынести в .env / переменные окружения
+# НАСТРОЙКИ — читаются из переменных окружения / .env
 # ---------------------------------------------------------------------------
 HA_URL      = os.getenv("HA_URL",   "http://homeassistant.local:8123")
 HA_TOKEN    = os.getenv("HA_TOKEN", "YOUR_LONG_LIVED_TOKEN_HERE")
@@ -213,78 +210,90 @@ def insert_reading(conn, recorded_at: datetime, room: str,
 def main() -> None:
     log.info("=== Старт сбора показаний ===")
 
-    # --- Подключение к PostgreSQL ---
-    conn = psycopg2.connect(PG_DSN)
-    conn.autocommit = False
-
-    # --- Инициализация схемы ---
-    with conn.cursor() as cur:
-        cur.execute(DDL)
-        cur.execute(SEED_TARIFFS)
-    conn.commit()
-    log.info("Схема БД проверена / создана")
-
-    # --- Текущее время ---
-    now_utc   = datetime.now(tz=timezone.utc)
-    now_local = now_utc.astimezone(LOCAL_TZ)
-    log.info("Текущее время: %s (%s)", now_local.strftime("%Y-%m-%d %H:%M:%S %Z"), TIMEZONE)
-
-    # --- Определяем активный тариф ---
-    tariff = get_active_tariff(conn, now_local)
-    if tariff is None:
-        log.warning("Тариф для часа %d не найден! Запись будет с тарифом 'unknown'.", now_local.hour)
-        tariff_name = "unknown"
-    else:
-        tariff_name = tariff["name"]
-        log.info("Активный тариф: %s (%s), %d:00 – %d:59",
-                 tariff["name_ru"], tariff_name,
-                 tariff["hour_start"], tariff["hour_end"])
-
-    # --- Запрос состояний из HA ---
+    conn = None
     try:
-        all_states = get_ha_states(HA_URL, HA_TOKEN)
-    except requests.RequestException as exc:
-        log.error("Ошибка запроса к HA: %s", exc)
-        conn.close()
-        return
+        # --- Подключение к PostgreSQL ---
+        conn = psycopg2.connect(PG_DSN)
+        conn.autocommit = False
 
-    cnt_entities = filter_cnt_entities(all_states)
-    log.info("Найдено счётчиков (_cnt): %d", len(cnt_entities))
+        # --- Инициализация схемы ---
+        with conn.cursor() as cur:
+            cur.execute(DDL)
+            cur.execute(SEED_TARIFFS)
+        conn.commit()
+        log.info("Схема БД проверена / создана")
 
-    if not cnt_entities:
-        log.warning("Счётчики не найдены. Проверьте entity_id в HA.")
+        # --- Текущее время ---
+        now_utc   = datetime.now(tz=timezone.utc)
+        now_local = now_utc.astimezone(LOCAL_TZ)
+        log.info("Текущее время: %s (%s)", now_local.strftime("%Y-%m-%d %H:%M:%S %Z"), TIMEZONE)
 
-    # --- Обход счётчиков ---
-    for state in cnt_entities:
-        entity_id = state["entity_id"]
-        room      = room_from_entity(entity_id)
+        # --- Определяем активный тариф ---
+        tariff = get_active_tariff(conn, now_local)
+        if tariff is None:
+            log.warning("Тариф для часа %d не найден! Запись будет с тарифом 'unknown'.", now_local.hour)
+            tariff_name = "unknown"
+        else:
+            tariff_name = tariff["name"]
+            log.info("Активный тариф: %s (%s), %d:00 – %d:59",
+                     tariff["name_ru"], tariff_name,
+                     tariff["hour_start"], tariff["hour_end"])
 
-        energy = parse_energy(state)
-        if energy is None:
-            log.warning("Нет поля 'energy' у %s, пропускаем", entity_id)
-            continue
-
-        # Время последнего обновления из HA (надёжнее, чем datetime.now)
-        last_updated_str = state.get("last_updated")
+        # --- Запрос состояний из HA ---
         try:
-            # HA отдаёт ISO 8601 с Z или +00:00
-            recorded_at = datetime.fromisoformat(
-                last_updated_str.replace("Z", "+00:00")
-            )
-        except (AttributeError, ValueError):
-            recorded_at = now_utc
-            log.debug("Не удалось разобрать last_updated у %s, используем now()", entity_id)
+            all_states = get_ha_states(HA_URL, HA_TOKEN)
+        except requests.RequestException as exc:
+            log.error("Ошибка запроса к HA: %s", exc)
+            return
 
-        # --- Проверка: нужно ли писать ---
-        if already_recorded(conn, room, tariff_name, recorded_at):
-            log.debug("Уже есть запись за этот час: %s / %s", room, tariff_name)
-            continue
+        cnt_entities = filter_cnt_entities(all_states)
+        log.info("Найдено счётчиков (_cnt): %d", len(cnt_entities))
 
-        # --- Вставка ---
-        insert_reading(conn, recorded_at, room, energy, tariff_name, entity_id)
+        if not cnt_entities:
+            log.warning("Счётчики не найдены. Проверьте entity_id в HA.")
 
-    log.info("=== Сбор завершён ===")
-    conn.close()
+        # --- Обход счётчиков ---
+        for state in cnt_entities:
+            entity_id = state["entity_id"]
+            room      = room_from_entity(entity_id)
+
+            energy = parse_energy(state)
+            if energy is None:
+                log.warning("Нет поля 'energy' у %s, пропускаем", entity_id)
+                continue
+
+            # Время последнего обновления из HA (надёжнее, чем datetime.now)
+            last_updated_str = state.get("last_updated")
+            try:
+                # HA отдаёт ISO 8601 с Z или +00:00
+                recorded_at = datetime.fromisoformat(
+                    last_updated_str.replace("Z", "+00:00")
+                )
+            except (AttributeError, ValueError):
+                recorded_at = now_utc
+                log.debug("Не удалось разобрать last_updated у %s, используем now()", entity_id)
+
+            # --- Проверка: нужно ли писать ---
+            if already_recorded(conn, room, tariff_name, recorded_at):
+                log.debug("Уже есть запись за этот час: %s / %s", room, tariff_name)
+                continue
+
+            # --- Вставка ---
+            insert_reading(conn, recorded_at, room, energy, tariff_name, entity_id)
+
+        log.info("=== Сбор завершён ===")
+    except psycopg2.Error as db_err:
+        log.error("Ошибка базы данных: %s", db_err)
+        if conn:
+            conn.rollback()
+    except Exception as exc:
+        log.error("Непредвиденная ошибка: %s", exc)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+            log.debug("Соединение с БД закрыто")
 
 
 if __name__ == "__main__":
