@@ -46,3 +46,7 @@ coverage.xml
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# additional (sss)
+s_notes.md
+.aider*
