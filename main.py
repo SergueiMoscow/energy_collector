@@ -15,6 +15,13 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# Загружаем переменные из .env файла (если он есть)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # если python-dotenv не установлен, продолжаем без .env
+
 # ---------------------------------------------------------------------------
 # НАСТРОЙКИ — можно вынести в .env / переменные окружения
 # ---------------------------------------------------------------------------
